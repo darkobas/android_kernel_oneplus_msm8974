@@ -30,7 +30,7 @@
 #include <linux/regulator/consumer.h>
 #include <linux/of_gpio.h>
 #include <linux/rtc.h>
-#include <linux/lcd_notify.h>
+#include <linux/fb.h>
 #include <linux/proc_fs.h>
 #include <linux/input/mt.h>
 
@@ -2375,7 +2375,7 @@ static void synaptics_rmi4_pm_main(struct work_struct *work)
 		synaptics_rmi4_suspend(rmi4_data);
 }
 
-static int lcd_notifier_callback(struct notifier_block *nb,
+static int fb_notifier_callback(struct notifier_block *nb,
 		unsigned long event, void *data)
 {
 	struct synaptics_rmi4_data *rmi4_data =
@@ -2404,7 +2404,7 @@ static int lcd_notifier_callback(struct notifier_block *nb,
 		break;
 	}
 
-	rmi4_data->old_status = event;
+	rmi4_data->old_status = *blank;
 
 	return NOTIFY_OK;
 }
