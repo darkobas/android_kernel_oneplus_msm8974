@@ -179,13 +179,21 @@ eHalStatus wlan_hdd_remain_on_channel_callback( tHalHandle hHal, void* pCtx,
     hdd_adapter_t *pAdapter = (hdd_adapter_t*) pCtx;
     hdd_cfg80211_state_t *cfgState = WLAN_HDD_GET_CFG_STATE_PTR( pAdapter );
     hdd_remain_on_chan_ctx_t *pRemainChanCtx = cfgState->remain_on_chan_ctx;
+    hdd_context_t *pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
 
-    if( pRemainChanCtx == NULL )
+    if (pHddCtx == NULL)
+    {
+        hddLog(LOGE, "%s: Hdd Context is NULL", __func__);
+        return eHAL_STATUS_FAILURE;
+    }
+    if (pRemainChanCtx == NULL)
     {
        hddLog( LOGW,
           "%s: No Rem on channel pending for which Rsp is received", __func__);
        return eHAL_STATUS_SUCCESS;
     }
+
+    mutex_lock(&pHddCtx->roc_lock);
     hddLog( VOS_TRACE_LEVEL_INFO,
             "Received ROC rsp (request type %d, channel %d, cookie %llu",
             pRemainChanCtx->rem_on_chan_request,
@@ -194,6 +202,7 @@ eHalStatus wlan_hdd_remain_on_channel_callback( tHalHandle hHal, void* pCtx,
     cfgState->remain_on_chan_ctx = NULL;
     vos_timer_stop(&pRemainChanCtx->hdd_remain_on_chan_timer);
     vos_timer_destroy(&pRemainChanCtx->hdd_remain_on_chan_timer);
+    mutex_unlock(&pHddCtx->roc_lock);
     if ( REMAIN_ON_CHANNEL_REQUEST == pRemainChanCtx->rem_on_chan_request )
     {
         if( cfgState->buf )
@@ -257,8 +266,16 @@ VOS_STATUS wlan_hdd_cancel_existing_remain_on_channel(hdd_adapter_t *pAdapter)
 {
     hdd_cfg80211_state_t *cfgState = WLAN_HDD_GET_CFG_STATE_PTR( pAdapter );
     hdd_remain_on_chan_ctx_t *pRemainChanCtx = cfgState->remain_on_chan_ctx;
+    hdd_context_t *pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
     int status = 0;
 
+    if (NULL == pHddCtx)
+    {
+        hddLog(LOGE, "%s: HddCtx is NULL", __func__);
+        return VOS_STATUS_E_FAILURE;
+    }
+
+    mutex_lock(&pHddCtx->roc_lock);
     if(cfgState->remain_on_chan_ctx != NULL)
     {
         hddLog(VOS_TRACE_LEVEL_INFO,
@@ -266,74 +283,88 @@ VOS_STATUS wlan_hdd_cancel_existing_remain_on_channel(hdd_adapter_t *pAdapter)
                 cfgState->remain_on_chan_ctx->cookie);
 
         vos_timer_stop(&cfgState->remain_on_chan_ctx->hdd_remain_on_chan_timer);
-        if (pRemainChanCtx->hdd_remain_on_chan_cancel_in_progress == TRUE)
-        {
-            hddLog( LOG1,
-                    "ROC timer cancellation in progress,"
-                    " wait for completion");
-            status = wait_for_completion_interruptible_timeout(&pAdapter->cancel_rem_on_chan_var,
-                               msecs_to_jiffies(WAIT_CANCEL_REM_CHAN));
-            if (0 >= status)
-            {
-                hddLog( LOGE,
-                        "%s:wait on cancel_rem_on_chan_var failed %d",
-                         __func__, status);
-                return VOS_STATUS_E_FAILURE;
-            }
-            return VOS_STATUS_SUCCESS;
-        }
 
         /* Wait till remain on channel ready indication before issuing cancel
          * remain on channel request, otherwise if remain on channel not
          * received and if the driver issues cancel remain on channel then lim
          * will be in unknown state.
          */
-        status = wait_for_completion_interruptible_timeout(&pAdapter->rem_on_chan_ready_event,
-               msecs_to_jiffies(WAIT_REM_CHAN_READY));
-        if (0 >= status)
+        if (pRemainChanCtx->hdd_remain_on_chan_cancel_in_progress != TRUE)
         {
-            hddLog( LOGE, 
-              "%s: timeout waiting for remain on channel ready indication %d",
-                    __func__, status);
-            pRemainChanCtx->is_pending_roc_cancelled = TRUE;
-            return VOS_STATUS_E_FAILURE;
-        }
+            status = wait_for_completion_interruptible_timeout(
+                                        &pAdapter->rem_on_chan_ready_event,
+                                        msecs_to_jiffies(WAIT_REM_CHAN_READY));
+            if (0 >= status)
+            {
+                hddLog( LOGE,
+                       "%s: timeout waiting for remain on channel"
+                       " ready indication %d",
+                        __func__, status);
+                pRemainChanCtx->is_pending_roc_cancelled = TRUE;
+                mutex_unlock(&pHddCtx->roc_lock);
+                return VOS_STATUS_E_FAILURE;
+            }
 
-        INIT_COMPLETION(pAdapter->cancel_rem_on_chan_var);
-        pRemainChanCtx->hdd_remain_on_chan_cancel_in_progress = TRUE;
+            INIT_COMPLETION(pAdapter->cancel_rem_on_chan_var);
+            pRemainChanCtx->hdd_remain_on_chan_cancel_in_progress = TRUE;
+            mutex_unlock(&pHddCtx->roc_lock);
 
-        /* Issue abort remain on chan request to sme.
-         * The remain on channel callback will make sure the remain_on_chan
-         * expired event is sent.
-        */
-        if ( ( WLAN_HDD_INFRA_STATION == pAdapter->device_mode ) ||
-             ( WLAN_HDD_P2P_CLIENT == pAdapter->device_mode ) ||
-             ( WLAN_HDD_P2P_DEVICE == pAdapter->device_mode )
-           )
-        {
-            sme_CancelRemainOnChannel( WLAN_HDD_GET_HAL_CTX( pAdapter ),
+             /* Issue abort remain on chan request to sme.
+              * The remain on channel callback will make sure the remain_on_chan
+              * expired event is sent.
+              */
+              if (( WLAN_HDD_INFRA_STATION == pAdapter->device_mode ) ||
+                 ( WLAN_HDD_P2P_CLIENT == pAdapter->device_mode ) ||
+                 ( WLAN_HDD_P2P_DEVICE == pAdapter->device_mode ))
+              {
+                  sme_CancelRemainOnChannel( WLAN_HDD_GET_HAL_CTX( pAdapter ),
                                                      pAdapter->sessionId );
-        }
-        else if ( (WLAN_HDD_SOFTAP== pAdapter->device_mode) ||
-                  (WLAN_HDD_P2P_GO == pAdapter->device_mode)
-                )
-        {
-            WLANSAP_CancelRemainOnChannel(
-                                     (WLAN_HDD_GET_CTX(pAdapter))->pvosContext);
-        }
+              }
+              else if ( (WLAN_HDD_SOFTAP== pAdapter->device_mode) ||
+                      (WLAN_HDD_P2P_GO == pAdapter->device_mode))
+              {
+                   WLANSAP_CancelRemainOnChannel(
+                          (WLAN_HDD_GET_CTX(pAdapter))->pvosContext);
+              }
 
-        status = wait_for_completion_interruptible_timeout(&pAdapter->cancel_rem_on_chan_var,
-               msecs_to_jiffies(WAIT_CANCEL_REM_CHAN));
-
-        if (0 >= status)
-        {
-            hddLog( LOGE, 
-                "%s: timeout waiting for cancel remain on channel ready indication %d",
-                   __func__, status);
-        }
-       hdd_allow_suspend();
+              status = wait_for_completion_interruptible_timeout(
+                                       &pAdapter->cancel_rem_on_chan_var,
+                                       msecs_to_jiffies(WAIT_CANCEL_REM_CHAN));
+              if (0 >= status)
+              {
+                  hddLog( LOGE,
+                          "%s: timeout waiting for cancel remain on channel"
+                          " ready indication %d",
+                           __func__, status);
+              }
+              hdd_allow_suspend();
+         }
+         else
+         {
+              hddLog( LOG1,
+                      "ROC timer cancellation in progress,"
+                      " wait for completion");
+              mutex_unlock(&pHddCtx->roc_lock);
+              status = wait_for_completion_interruptible_timeout(
+                                     &pAdapter->cancel_rem_on_chan_var,
+                                     msecs_to_jiffies(WAIT_CANCEL_REM_CHAN));
+              if (0 >= status)
+              {
+                  hddLog( LOGE,
+                          "%s:wait on cancel_rem_on_chan_var failed %d",
+                           __func__, status);
+                  return VOS_STATUS_E_FAILURE;
+              }
+              return VOS_STATUS_SUCCESS;
+         }
     }
-       return VOS_STATUS_SUCCESS;
+    else
+    {
+       hddLog(LOG1,
+               "%s: remain_on_chan_ctx is NULL", __func__);
+       mutex_unlock(&pHddCtx->roc_lock);
+    }
+    return VOS_STATUS_SUCCESS;
 }
 
 int wlan_hdd_check_remain_on_channel(hdd_adapter_t *pAdapter)
@@ -1078,7 +1109,7 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
         rem_on_channel_request_type_t req_type = OFF_CHANNEL_ACTION_TX;
         // In case of P2P Client mode if we are already
         // on the same channel then send the frame directly
-
+        mutex_lock(&pHddCtx->roc_lock);
         if( (cfgState->remain_on_chan_ctx != NULL) &&
             (cfgState->current_freq == chan->center_freq)
           )
@@ -1118,6 +1149,7 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
                 hddLog(VOS_TRACE_LEVEL_INFO,
                    "action frame: extending the wait time %u",
                    wait);
+                mutex_unlock(&pHddCtx->roc_lock);
                 goto send_frame;
             }
             else
@@ -1125,6 +1157,7 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
                 if ( TRUE ==
                      pRemainChanCtx->hdd_remain_on_chan_cancel_in_progress )
                 {
+                    mutex_unlock(&pHddCtx->roc_lock);
                     hddLog(VOS_TRACE_LEVEL_INFO,
                            "action frame tx: waiting for completion of ROC ");
 
@@ -1137,12 +1170,14 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
                                "%s:wait on cancel_rem_on_chan_var failed %d",
                                 __func__, status);
                     }
+                    goto bypass_lock;
                 }
             }
         }
+        mutex_unlock(&pHddCtx->roc_lock);
+bypass_lock:
         hddLog(VOS_TRACE_LEVEL_INFO,
                "action frame: Request ROC for wait time %u", wait);
-
         INIT_COMPLETION(pAdapter->offchannel_tx_event);
         status = wlan_hdd_request_remain_on_channel(wiphy, dev,
                                         chan,
@@ -1196,8 +1231,10 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,38))
         if( cfgState->remain_on_chan_ctx )
         {
+            mutex_lock(&pHddCtx->roc_lock);
             cfgState->action_cookie = cfgState->remain_on_chan_ctx->cookie;
             *cookie = cfgState->action_cookie;
+            mutex_unlock(&pHddCtx->roc_lock);
         }
         else
         {
@@ -2215,20 +2252,6 @@ void hdd_indicateMgmtFrame( hdd_adapter_t *pAdapter,
                  hddLog( LOG1, "%s:"
                          "Rcvd action frame after timer expired ", __func__);
 
-             if( (actionFrmType == WLAN_HDD_PROV_DIS_REQ) ||
-                 (actionFrmType == WLAN_HDD_GO_NEG_REQ) ||
-                 (actionFrmType == WLAN_HDD_INVITATION_REQ) )
-             {
-                 pScanInfo =  &pHddCtx->scan_info;
-                 if((pScanInfo != NULL) && (pHddCtx->scan_info.mScanPending))
-                 {
-                     hddLog(LOGE,"Action frame received when Scanning is in"
-                                 " progress. Abort Scan.");
-                     hdd_abort_mac_scan(pAdapter->pHddCtx,
-                                        pAdapter->sessionId,
-                                        eCSR_SCAN_ABORT_DEFAULT);
-                 }
-             }
              if (((actionFrmType == WLAN_HDD_PROV_DIS_RESP) &&
                    (cfgState->actionFrmState == HDD_PD_REQ_ACK_PENDING)) ||
                   ((actionFrmType == WLAN_HDD_GO_NEG_RESP) &&
@@ -2252,6 +2275,16 @@ void hdd_indicateMgmtFrame( hdd_adapter_t *pAdapter,
             }
 #endif
         }
+
+         pScanInfo =  &pHddCtx->scan_info;
+         if ((pScanInfo != NULL) && (pHddCtx->scan_info.mScanPending))
+         {
+             hddLog(LOGE,"Action frame received when Scanning is in"
+                          " progress. Abort Scan.");
+             hdd_abort_mac_scan(pAdapter->pHddCtx,
+                                pScanInfo->sessionId,
+                                eCSR_SCAN_ABORT_DEFAULT);
+         }
 #ifdef WLAN_FEATURE_TDLS_DEBUG
         if(pbFrames[WLAN_HDD_PUBLIC_ACTION_FRAME_OFFSET] == WLAN_HDD_TDLS_ACTION_FRAME)
         {
