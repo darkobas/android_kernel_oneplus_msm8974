@@ -17,15 +17,18 @@
  *
  */
 
-#define pr_fmt(fmt) "MSM_THERMAL: " fmt
+#define pr_fmt(fmt) "msm-thermal: " fmt
 
 #include <linux/cpu.h>
 #include <linux/cpufreq.h>
+#include <linux/err.h>
 #include <linux/kernel.h>
-#include <linux/msm_tsens.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/qpnp/qpnp-adc.h>
 #include <linux/slab.h>
 
-#define TSENS_SENSOR 0
 #define DEFAULT_SAMPLING_MS 3000
 
 enum thermal_state {
@@ -40,11 +43,13 @@ struct throttle_policy {
 	unsigned int throttle_freq;
 };
 
-static DEFINE_PER_CPU(struct throttle_policy, throttle_info);
+static struct throttle_policy *t_pol;
 static struct delayed_work thermal_work;
 static struct workqueue_struct *thermal_wq;
 
 struct thermal_config {
+	struct qpnp_vadc_chip *vadc_dev;
+	enum qpnp_vadc_channels adc_chan;
 	unsigned int freq_high_KHz;
 	unsigned int freq_mid_KHz;
 	unsigned int freq_low_KHz;
@@ -59,125 +64,114 @@ struct thermal_config {
 	unsigned int user_maxfreq;
 };
 
-static struct thermal_config *thermal_conf;
+static struct thermal_config *t_conf;
+
+static void update_online_cpu_policy(void)
+{
+	unsigned int cpu;
+
+	/* Trigger cpufreq notifier for online CPUs */
+	get_online_cpus();
+	for_each_online_cpu(cpu)
+		cpufreq_update_policy(cpu);
+	put_online_cpus();
+}
 
 static void msm_thermal_main(struct work_struct *work)
 {
-	struct tsens_device tsens_dev;
-	struct throttle_policy *t;
-	unsigned long temp;
-	unsigned int cpu, old_throttle;
-	bool throttle_logged = false;
+	struct qpnp_vadc_result result;
+	enum thermal_state old_throttle;
+	int64_t temp;
 	int ret;
 
-	tsens_dev.sensor_num = TSENS_SENSOR;
-	ret = tsens_get_temp(&tsens_dev, &temp);
-	/* bound check */
-	if (ret || temp > 1000) {
-		pr_err("Unable to read tsens sensor #%d\n", tsens_dev.sensor_num);
+	ret = qpnp_vadc_read(t_conf->vadc_dev, t_conf->adc_chan, &result);
+	if (ret) {
+		pr_err("Unable to read ADC channel\n");
 		goto reschedule;
 	}
 
-	get_online_cpus();
-	for_each_possible_cpu(cpu) {
-		t = &per_cpu(throttle_info, cpu);
+	temp = result.physical;
+	old_throttle = t_pol->cpu_throttle;
 
-		old_throttle = t->cpu_throttle;
-
-		/* low trip point */
-		if ((temp >= thermal_conf->trip_low_degC) &&
-		(temp < thermal_conf->trip_mid_degC) &&
-			(t->cpu_throttle == UNTHROTTLE)) {
-			t->throttle_freq = thermal_conf->freq_low_KHz;
-			t->cpu_throttle = LOW_THROTTLE;
-		/* low clear point */
-		} else if ((temp <= thermal_conf->reset_low_degC) &&
-			(t->cpu_throttle > UNTHROTTLE)) {
-			t->cpu_throttle = UNTHROTTLE;
-		/* mid trip point */
-		} else if ((temp >= thermal_conf->trip_mid_degC) &&
-			(temp < thermal_conf->trip_high_degC) &&
-			(t->cpu_throttle < MID_THROTTLE)) {
-			t->throttle_freq = thermal_conf->freq_mid_KHz;
-			t->cpu_throttle = MID_THROTTLE;
-		/* mid clear point */
-		} else if ((temp < thermal_conf->reset_mid_degC) &&
-			(t->cpu_throttle > LOW_THROTTLE)) {
-			t->throttle_freq = thermal_conf->freq_low_KHz;
-			t->cpu_throttle = LOW_THROTTLE;
-		/* high trip point */
-		} else if ((temp >= thermal_conf->trip_high_degC) &&
-			(t->cpu_throttle < HIGH_THROTTLE)) {
-			t->throttle_freq = thermal_conf->freq_high_KHz;
-			t->cpu_throttle = HIGH_THROTTLE;
-		/* high clear point */
-		} else if ((temp < thermal_conf->reset_high_degC) &&
-			(t->cpu_throttle > MID_THROTTLE)) {
-			t->throttle_freq = thermal_conf->freq_mid_KHz;
-			t->cpu_throttle = MID_THROTTLE;
-		}
-
-		/* logging */
-		if ((t->cpu_throttle != old_throttle) && !throttle_logged) {
-			if (t->cpu_throttle)
-				pr_warn("Setting CPU to %uKHz! temp: %luC\n",
-							t->throttle_freq, temp);
-			else
-				pr_warn("CPU unthrottled! temp: %luC\n", temp);
-			throttle_logged = true;
-		}
-
-		/* trigger cpufreq notifier */
-		if (cpu_online(cpu))
-			cpufreq_update_policy(cpu);
+	/* Low trip point */
+	if ((temp >= t_conf->trip_low_degC) &&
+		(temp < t_conf->trip_mid_degC) &&
+		(t_pol->cpu_throttle == UNTHROTTLE)) {
+		t_pol->throttle_freq = t_conf->freq_low_KHz;
+		t_pol->cpu_throttle = LOW_THROTTLE;
+	/* Low clear point */
+	} else if ((temp <= t_conf->reset_low_degC) &&
+		(t_pol->cpu_throttle > UNTHROTTLE)) {
+		t_pol->cpu_throttle = UNTHROTTLE;
+	/* Mid trip point */
+	} else if ((temp >= t_conf->trip_mid_degC) &&
+		(temp < t_conf->trip_high_degC) &&
+		(t_pol->cpu_throttle < MID_THROTTLE)) {
+		t_pol->throttle_freq = t_conf->freq_mid_KHz;
+		t_pol->cpu_throttle = MID_THROTTLE;
+	/* Mid clear point */
+	} else if ((temp < t_conf->reset_mid_degC) &&
+		(t_pol->cpu_throttle > LOW_THROTTLE)) {
+		t_pol->throttle_freq = t_conf->freq_low_KHz;
+		t_pol->cpu_throttle = LOW_THROTTLE;
+	/* High trip point */
+	} else if ((temp >= t_conf->trip_high_degC) &&
+		(t_pol->cpu_throttle < HIGH_THROTTLE)) {
+		t_pol->throttle_freq = t_conf->freq_high_KHz;
+		t_pol->cpu_throttle = HIGH_THROTTLE;
+	/* High clear point */
+	} else if ((temp < t_conf->reset_high_degC) &&
+		(t_pol->cpu_throttle > MID_THROTTLE)) {
+		t_pol->throttle_freq = t_conf->freq_mid_KHz;
+		t_pol->cpu_throttle = MID_THROTTLE;
 	}
-	put_online_cpus();
+
+	/* Thermal state changed */
+	if (t_pol->cpu_throttle != old_throttle) {
+		if (t_pol->cpu_throttle)
+			pr_warn("Setting CPU to %uKHz! temp: %lluC\n",
+						t_pol->throttle_freq, temp);
+		else
+			pr_warn("CPU unthrottled! temp: %lluC\n", temp);
+		/* Immediately enforce new thermal policy on online CPUs */
+		update_online_cpu_policy();
+	}
 
 reschedule:
-	queue_delayed_work_on(0, thermal_wq, &thermal_work,
-				msecs_to_jiffies(thermal_conf->sampling_ms));
+	queue_delayed_work(thermal_wq, &thermal_work,
+				msecs_to_jiffies(t_conf->sampling_ms));
 }
 
-static void cpu_unthrottle_all(void)
+static void unthrottle_all_cpus(void)
 {
-	struct throttle_policy *t;
-	unsigned int cpu;
-
-	get_online_cpus();
-	for_each_possible_cpu(cpu) {
-		t = &per_cpu(throttle_info, cpu);
-		t->cpu_throttle = UNTHROTTLE;
-		if (cpu_online(cpu))
-			cpufreq_update_policy(cpu);
-	}
-	put_online_cpus();
+	t_pol->cpu_throttle = UNTHROTTLE;
+	update_online_cpu_policy();
 }
 
 static int cpu_do_throttle(struct notifier_block *nb, unsigned long val, void *data)
 {
 	struct cpufreq_policy *policy = data;
-	struct throttle_policy *t = &per_cpu(throttle_info, policy->cpu);
-	unsigned int user_max = thermal_conf->user_maxfreq;
+	unsigned int user_max = t_conf->user_maxfreq;
 
 	if (val != CPUFREQ_ADJUST)
 		return NOTIFY_OK;
 
-	switch (t->cpu_throttle) {
+	switch (t_pol->cpu_throttle) {
 	case UNTHROTTLE:
 		policy->max = user_max ? user_max : policy->cpuinfo.max_freq;
 		break;
 	case LOW_THROTTLE:
 	case MID_THROTTLE:
 	case HIGH_THROTTLE:
-		if (user_max && (user_max < t->throttle_freq))
+		if (user_max && (user_max < t_pol->throttle_freq))
 			policy->max = user_max;
 		else
-			policy->max = t->throttle_freq;
+			policy->max = t_pol->throttle_freq;
 		break;
 	}
 
 	if (policy->min > policy->max)
-		policy->min = policy->cpuinfo.min_freq;
+		policy->min = policy->max;
 
 	return NOTIFY_OK;
 }
@@ -198,9 +192,9 @@ static ssize_t high_thresh_write(struct device *dev,
 	if (ret != 3)
 		return -EINVAL;
 
-	thermal_conf->freq_high_KHz = data[0];
-	thermal_conf->trip_high_degC = data[1];
-	thermal_conf->reset_high_degC = data[2];
+	t_conf->freq_high_KHz = data[0];
+	t_conf->trip_high_degC = data[1];
+	t_conf->reset_high_degC = data[2];
 
 	return size;
 }
@@ -214,9 +208,9 @@ static ssize_t mid_thresh_write(struct device *dev,
 	if (ret != 3)
 		return -EINVAL;
 
-	thermal_conf->freq_mid_KHz = data[0];
-	thermal_conf->trip_mid_degC = data[1];
-	thermal_conf->reset_mid_degC = data[2];
+	t_conf->freq_mid_KHz = data[0];
+	t_conf->trip_mid_degC = data[1];
+	t_conf->reset_mid_degC = data[2];
 
 	return size;
 }
@@ -230,9 +224,9 @@ static ssize_t low_thresh_write(struct device *dev,
 	if (ret != 3)
 		return -EINVAL;
 
-	thermal_conf->freq_low_KHz = data[0];
-	thermal_conf->trip_low_degC = data[1];
-	thermal_conf->reset_low_degC = data[2];
+	t_conf->freq_low_KHz = data[0];
+	t_conf->trip_low_degC = data[1];
+	t_conf->reset_low_degC = data[2];
 
 	return size;
 }
@@ -246,7 +240,7 @@ static ssize_t sampling_ms_write(struct device *dev,
 	if (ret != 1)
 		return -EINVAL;
 
-	thermal_conf->sampling_ms = data;
+	t_conf->sampling_ms = data;
 
 	return size;
 }
@@ -260,14 +254,14 @@ static ssize_t enabled_write(struct device *dev,
 	if (ret != 1)
 		return -EINVAL;
 
-	thermal_conf->enabled = data;
+	t_conf->enabled = data;
 
 	cancel_delayed_work_sync(&thermal_work);
 
 	if (data)
-		queue_delayed_work_on(0, thermal_wq, &thermal_work, 0);
+		queue_delayed_work(thermal_wq, &thermal_work, 0);
 	else
-		cpu_unthrottle_all();
+		unthrottle_all_cpus();
 
 	return size;
 }
@@ -281,7 +275,7 @@ static ssize_t user_maxfreq_write(struct device *dev,
 	if (ret != 1)
 		return -EINVAL;
 
-	thermal_conf->user_maxfreq = data;
+	t_conf->user_maxfreq = data;
 
 	return size;
 }
@@ -289,40 +283,40 @@ static ssize_t user_maxfreq_write(struct device *dev,
 static ssize_t high_thresh_read(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%u %u %u\n", thermal_conf->freq_high_KHz,
-			thermal_conf->trip_high_degC, thermal_conf->reset_high_degC);
+	return snprintf(buf, PAGE_SIZE, "%u %u %u\n", t_conf->freq_high_KHz,
+			t_conf->trip_high_degC, t_conf->reset_high_degC);
 }
 
 static ssize_t mid_thresh_read(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%u %u %u\n", thermal_conf->freq_mid_KHz,
-			thermal_conf->trip_mid_degC, thermal_conf->reset_mid_degC);
+	return snprintf(buf, PAGE_SIZE, "%u %u %u\n", t_conf->freq_mid_KHz,
+			t_conf->trip_mid_degC, t_conf->reset_mid_degC);
 }
 
 static ssize_t low_thresh_read(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%u %u %u\n", thermal_conf->freq_low_KHz,
-			thermal_conf->trip_low_degC, thermal_conf->reset_low_degC);
+	return snprintf(buf, PAGE_SIZE, "%u %u %u\n", t_conf->freq_low_KHz,
+			t_conf->trip_low_degC, t_conf->reset_low_degC);
 }
 
 static ssize_t sampling_ms_read(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%u\n", thermal_conf->sampling_ms);
+	return snprintf(buf, PAGE_SIZE, "%u\n", t_conf->sampling_ms);
 }
 
 static ssize_t enabled_read(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%u\n", thermal_conf->enabled);
+	return snprintf(buf, PAGE_SIZE, "%u\n", t_conf->enabled);
 }
 
 static ssize_t user_maxfreq_read(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%u\n", thermal_conf->user_maxfreq);
+	return snprintf(buf, PAGE_SIZE, "%u\n", t_conf->user_maxfreq);
 }
 
 static DEVICE_ATTR(high_thresh, 0644, high_thresh_read, high_thresh_write);
@@ -347,11 +341,41 @@ static struct attribute_group msm_thermal_attr_group = {
 };
 /*********************** SYSFS END ***********************/
 
-static int __init msm_thermal_init(void)
+static int msm_thermal_probe(struct platform_device *pdev)
 {
+	struct device_node *np = pdev->dev.of_node;
 	int ret;
 
-	thermal_wq = alloc_workqueue("msm_thermal_wq", WQ_HIGHPRI, 0);
+	t_pol = kzalloc(sizeof(struct throttle_policy), GFP_KERNEL);
+	if (!t_pol) {
+		pr_err("Failed to allocate thermal_policy struct\n");
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	t_conf = kzalloc(sizeof(struct thermal_config), GFP_KERNEL);
+	if (!t_conf) {
+		pr_err("Failed to allocate thermal_config struct\n");
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	t_conf->vadc_dev = qpnp_get_vadc(&pdev->dev, "thermal");
+	if (IS_ERR(t_conf->vadc_dev)) {
+		ret = PTR_ERR(t_conf->vadc_dev);
+		if (ret != -EPROBE_DEFER)
+			pr_err("VADC property missing\n");
+		goto err;
+	}
+
+	ret = of_property_read_u32(np, "qcom,adc-channel", &t_conf->adc_chan);
+	if (ret) {
+		pr_err("ADC-channel property missing\n");
+		goto err;
+	}
+
+	thermal_wq = alloc_workqueue("msm_thermal_wq",
+					WQ_HIGHPRI | WQ_NON_REENTRANT, 0);
 	if (!thermal_wq) {
 		pr_err("Failed to allocate workqueue\n");
 		ret = -EFAULT;
@@ -360,14 +384,7 @@ static int __init msm_thermal_init(void)
 
 	cpufreq_register_notifier(&cpu_throttle_nb, CPUFREQ_POLICY_NOTIFIER);
 
-	thermal_conf = kzalloc(sizeof(struct thermal_config), GFP_KERNEL);
-	if (!thermal_conf) {
-		pr_err("Failed to allocate thermal_conf struct\n");
-		ret = -ENOMEM;
-		goto err;
-	}
-
-	thermal_conf->sampling_ms = DEFAULT_SAMPLING_MS;
+	t_conf->sampling_ms = DEFAULT_SAMPLING_MS;
 
 	INIT_DELAYED_WORK(&thermal_work, msm_thermal_main);
 
@@ -386,4 +403,23 @@ static int __init msm_thermal_init(void)
 err:
 	return ret;
 }
-fs_initcall(msm_thermal_init);
+
+static struct of_device_id msm_thermal_match_table[] = {
+	{.compatible = "qcom,msm-thermal-simple"},
+	{ },
+};
+
+static struct platform_driver msm_thermal_device = {
+	.probe = msm_thermal_probe,
+	.driver = {
+		.name = "msm-thermal-simple",
+		.owner = THIS_MODULE,
+		.of_match_table = msm_thermal_match_table,
+	},
+};
+
+static int __init msm_thermal_init(void)
+{
+	return platform_driver_register(&msm_thermal_device);
+}
+late_initcall(msm_thermal_init);
