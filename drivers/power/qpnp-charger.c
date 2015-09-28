@@ -267,13 +267,13 @@
 
 #define AUTO_CHARGING_BATT_TEMP_T0                           -100 
 #define AUTO_CHARGING_BATT_TEMP_T1                            0    
-#define AUTO_CHARGING_BATT_TEMP_T2                            100 /* yangfangbiao@oneplus.cn, 2015/01/06  Add for  sync with KK charge standard  */
-#define AUTO_CHARGING_BATT_TEMP_T3							  150 /* yangfangbiao@oneplus.cn, 2015/01/06  Add for  sync with KK charge standard  */
+#define AUTO_CHARGING_BATT_TEMP_T2                            30 /* yangfangbiao@oneplus.cn, 2015/01/06  Add for  sync with KK charge standard  */
+#define AUTO_CHARGING_BATT_TEMP_T3							  70 /* yangfangbiao@oneplus.cn, 2015/01/06  Add for  sync with KK charge standard  */
 #define AUTO_CHARGING_BATT_TEMP_T4                            450  /* yangfangbiao@oneplus.cn, 2015/01/06  Add for  sync with KK charge standard  */
 #define AUTO_CHARGING_BATT_TEMP_T5                            550  /* yangfangbiao@oneplus.cn, 2015/01/06  Add for  sync with KK charge standard  */
 #define AUTO_CHARGING_BATT_REMOVE_TEMP                        -400 
-#define AUTO_CHARGING_BATTERY_TEMP_HYST_FROM_HOT_TO_WARM      30
-#define AUTO_CHARGING_BATTERY_TEMP_HYST_FROM_WARM_TO_NORMAL   10
+#define AUTO_CHARGING_BATTERY_TEMP_HYST_FROM_HOT_TO_WARM      40
+#define AUTO_CHARGING_BATTERY_TEMP_HYST_FROM_WARM_TO_NORMAL   30
 #define AUTO_CHARGING_BATTERY_TEMP_HYST_FROM_COOL_TO_NORMAL   10
 #define AUTO_CHARGING_BATTERY_TEMP_HYST_FROM_COLD_TO_COOL     30
 
@@ -7391,7 +7391,7 @@ static int handle_batt_temp_normal(struct qpnp_chg_chip *chip)
 					if (chip->aicl_current >= 1500) {
 #ifdef CONFIG_MACH_MSM8974_14001
 /* OPPO 2014-06-03 sjc Modify for Find7op temp rising problem */
-						qpnp_chg_iusbmax_set(chip, 1200);
+						qpnp_chg_iusbmax_set(chip, chip->max_bat_chg_current);
 #else
 						qpnp_chg_iusbmax_set(chip, 1500);
 #endif
