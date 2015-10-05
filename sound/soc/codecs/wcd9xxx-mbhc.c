@@ -2482,7 +2482,9 @@ static void wcd9xxx_mbhc_decide_swch_plug(struct wcd9xxx_mbhc *mbhc)
 		wcd9xxx_find_plug_and_report(mbhc, PLUG_TYPE_HEADSET);
 	}
 
-	wcd9xxx_cleanup_hs_polling(mbhc);
+	if (mbhc->fast_detection != PLUG_TYPE_HEADSET)
+		wcd9xxx_cleanup_hs_polling(mbhc);
+
 	wcd9xxx_schedule_hs_detect_plug(mbhc, &mbhc->correct_plug_swch);
 #else
 	if (plug_type == PLUG_TYPE_INVALID ||
@@ -3185,12 +3187,20 @@ static int wcd9xxx_do_plug_correction(struct wcd9xxx_mbhc *mbhc, int retry,
 		}
 		WCD9XXX_BCL_UNLOCK(mbhc->resmgr);
 	} else {
+		if (from_loop && plug_type == PLUG_TYPE_HEADSET) {
+			hph_trans_cnt++;
+			if (hph_trans_cnt < HPH_TRANS_THRESHOLD)
+				return 0;
+		}
+
 		if (mbhc->fast_detection) {
 			switch (plug_type) {
 			case PLUG_TYPE_INVALID:
 			case PLUG_TYPE_HEADPHONE:
 			case PLUG_TYPE_HIGH_HPH:
 				return 0;
+			case PLUG_TYPE_GND_MIC_SWAP:
+				break;
 			default:
 				/* Break out of parent loop */
 				return 1;
@@ -3200,7 +3210,8 @@ static int wcd9xxx_do_plug_correction(struct wcd9xxx_mbhc *mbhc, int retry,
 		if (plug_type == PLUG_TYPE_GND_MIC_SWAP) {
 			pt_gnd_mic_swap_cnt++;
 			if (pt_gnd_mic_swap_cnt >=
-					GND_MIC_SWAP_THRESHOLD)
+					GND_MIC_SWAP_THRESHOLD &&
+					!mbhc->fast_detection)
 				wcd9xxx_handle_gnd_mic_swap(mbhc,
 						pt_gnd_mic_swap_cnt,
 						plug_type);
@@ -3208,12 +3219,6 @@ static int wcd9xxx_do_plug_correction(struct wcd9xxx_mbhc *mbhc, int retry,
 				 __func__);
 			return 0;
 		} else {
-			if (from_loop && plug_type == PLUG_TYPE_HEADSET) {
-				hph_trans_cnt++;
-				if (hph_trans_cnt < HPH_TRANS_THRESHOLD)
-					return 0;
-			}
-
 			WCD9XXX_BCL_LOCK(mbhc->resmgr);
 			/* Turn off override/current source */
 			if (current_source_enable)
@@ -3417,12 +3422,17 @@ static void wcd9xxx_correct_swch_plug(struct work_struct *work)
 	}
 
 #ifdef CONFIG_MACH_OPPO
-	/* Change to the correct plug type if fast-detection was wrong */
-	if (mbhc->fast_detection && plug_type != mbhc->fast_detection) {
-		mbhc->fast_detection = 0;
-		wcd9xxx_do_plug_correction(mbhc, retry, plug_type,
-				&correction, current_source_enable,
-				false);
+	if (mbhc->fast_detection) {
+		/* Change to the correct plug type if fast-detection was wrong */
+		if (plug_type != mbhc->fast_detection) {
+			mbhc->fast_detection = 0;
+			wcd9xxx_do_plug_correction(mbhc, retry, plug_type,
+					&correction, current_source_enable,
+					false);
+		} else if (plug_type == PLUG_TYPE_HEADSET) {
+			/* Restart button polling */
+			wcd9xxx_start_hs_polling(mbhc);
+		}
 	}
 #endif
 
